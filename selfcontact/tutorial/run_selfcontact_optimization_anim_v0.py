@@ -32,7 +32,8 @@ from selfcontact.losses import SelfContactOptiLoss
 from selfcontact.fitting import SelfContactOpti
 from selfcontact.utils.parse import DotConfig
 from selfcontact.utils.body_models import get_bodymodels
-from selfcontact.utils.extremities import get_extremities
+from selfcontact.utils.extremities import get_extremities,get_extremities_assign_bones
+from selfcontact.utils.visualization import save_smplx_mesh_bool,save_smplx_mesh_index
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.deterministic = True
@@ -41,12 +42,13 @@ torch.backends.cudnn.deterministic = True
 # different results when running the same script again. To
 # run the determinisitc version use the following lines:
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
-torch.use_deterministic_algorithms(True)
+# torch.use_deterministic_algorithms(True) # 需要 torch >= 1.10.0
 
 def main(cfg):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('Device: ', device)
+    
     # process arguments
     OUTPUT_DIR = cfg.output_folder
     HCP_PATH = osp.join(cfg.essentials_folder, 'hand_on_body_prior/smplx/smplx_handonbody_prior.pkl')
@@ -55,6 +57,8 @@ def main(cfg):
 
     npz_file = osp.join(cfg.essentials_folder, f'example_poses/pose1.npz') \
         if cfg.input_file == '' else cfg.input_file
+    file_name = os.path.basename(npz_file)
+    file_base_name, _ = os.path.splitext(file_name)
     print('Processing: ', npz_file)
 
     models = get_bodymodels(
@@ -105,11 +109,21 @@ def main(cfg):
    
     # load data
     data = np.load(npz_file)
-    gender = data['gender'][0].decode("utf-8")
-    betas = torch.from_numpy(data['betas']).unsqueeze(0).float()
+    if data['gender'].shape.__len__() > 1:
+        gender = data['gender'][0].decode("utf-8")
+    else:
+        gender = data['gender'].item()
+    if len(data['betas']) > 10:
+        betas = torch.from_numpy(data['betas'][:10]).unsqueeze(0).float()
+    else:
+        betas = torch.from_numpy(data['betas']).unsqueeze(0).float()
     global_orient = torch.zeros(1,3) if 'global_orient' not in data.keys() \
         else data['global_orient']
-    body_pose = torch.Tensor(data['body_pose'][3:66]).unsqueeze(0)
+    assign_frame_idx = cfg.assign_frame_idx if 'assign_frame_idx' in cfg else 0
+    if 'poses' in data.keys(): # 载入动画序列的某一帧
+        body_pose = torch.Tensor(data['poses'][assign_frame_idx][3:66]).unsqueeze(0)
+    else:
+        body_pose = torch.Tensor(data['body_pose'][3:66]).unsqueeze(0)
     # most AMASS meshes don't have hand poses, so we don't use them here.
     #left_hand_pose = torch.Tensor(data['body_pose'][75:81]).unsqueeze(0)
     #right_hand_pose = torch.Tensor(data['body_pose'][81:]).unsqueeze(0)
@@ -125,18 +139,22 @@ def main(cfg):
     model = models[gender]
     model.reset_params(**params)
 
+    start_optim = time.time()
     body = scopti.run(model, params)
-
+    print('Step Optimization: {:5f}'.format(time.time() - start_optim))
+    
     mesh = trimesh.Trimesh(body.vertices[0].detach().cpu().numpy(), model.faces)
-    mesh.export(osp.join(OUTPUT_DIR, f'output.obj'))
+    mesh.export(osp.join(OUTPUT_DIR, file_base_name+f'.obj'))
 
+    print('obj written to: '+osp.join(OUTPUT_DIR, file_base_name+f'.obj'))
     out_dict = {}
     for key, val in body.items():
         if val is not None:
             out_dict[key] = val.detach().cpu().numpy()
-    with open(osp.join(OUTPUT_DIR, f'output.pkl'), 'wb') as f:
+    with open(osp.join(OUTPUT_DIR, file_base_name+f'.pkl'), 'wb') as f:
         pickle.dump(out_dict, f)
-
+    print('pkl written to: '+osp.join(OUTPUT_DIR, file_base_name+f'.pkl'))
+    
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -151,7 +169,9 @@ if __name__ == "__main__":
         help='folder where the body models are saved.')
     parser.add_argument('--input_file', default='', 
         help='Input filename to be processed. Expects an npz file with the model parameters.')
-
+    parser.add_argument('--assign_frame_idx', default=0, type=int,
+                        help='assign_frame_idx for test')
+    
     args = parser.parse_args()
 
     with open(args.config, 'r') as stream:

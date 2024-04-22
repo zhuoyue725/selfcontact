@@ -26,7 +26,19 @@ from .body_segmentation import BatchBodySegment
 from .utils.sparse import sparse_batch_mm
 
 import os.path as osp
+import time
 
+def get_size_tensor(v2v):
+    # 获取单个元素所占用的字节数
+    element_size_bytes = v2v.element_size()
+
+    # 获取张量的总元素个数
+    total_elements = v2v.numel()
+    # 计算总共占用的内存大小（以字节为单位）
+    total_memory_bytes = element_size_bytes * total_elements
+    total_memory_mb = total_memory_bytes / (1024 * 1024)
+    print("张量 占用内存：{:.2f} MB".format(total_memory_mb))
+        
 class SelfContact(nn.Module):
     def __init__(self,
         geodesics_path='',
@@ -115,14 +127,14 @@ class SelfContact(nn.Module):
             self.register_buffer('geovec_verts', self.faces[self.geovec][:,0])
 
     def triangles(self, vertices):
-        # get triangles (close mouth for smplx)
+        # get triangles (close mouth for smplx) # [1, 20940, 3, 3]
         if self.model_type == 'smpl':
             triangles = vertices[:,self.faces,:]
         elif self.model_type == 'smplx':
-            mouth_vert = torch.mean(vertices[:,self.vert_ids_wt,:], 1,
+            mouth_vert = torch.mean(vertices[:,self.vert_ids_wt,:], 1, # 嘴巴部位的平均顶点
                         keepdim=True)
-            vertices_mc = torch.cat((vertices, mouth_vert), 1)
-            triangles = vertices_mc[:,self.faces_wt,:]
+            vertices_mc = torch.cat((vertices, mouth_vert), 1) # 拼接 [1, 10475+1, 3]
+            triangles = vertices_mc[:,self.faces_wt,:] # faces_wt [20940, 3]
         return triangles
 
     def get_intersection_mask(self, vertices, triangles, test_segments=True):
@@ -133,12 +145,20 @@ class SelfContact(nn.Module):
         bs, nv, _ = vertices.shape
 
         # split because of memory into two chunks
-        exterior = torch.zeros((bs, nv), device=vertices.device,
+        exterior = torch.zeros((bs, nv), device=vertices.device, # [1, 10475] 在外部则为True 
             dtype=torch.bool)
-        exterior[:, :5000] = winding_numbers(vertices[:,:5000,:],
-            triangles).le(0.99)
-        exterior[:, 5000:] = winding_numbers(vertices[:,5000:,:],
-            triangles).le(0.99)
+        # exterior[:, :5000] = winding_numbers(vertices[:,:5000,:],
+        #     triangles).le(0.99)
+        # exterior[:, 5000:] = winding_numbers(vertices[:,5000:,:],
+        #     triangles).le(0.99)
+
+        N = 5  # 分成 N 段，可以调整cuda线程？
+        chunk_size = vertices.shape[1] // N  # 计算每段的大小
+        for i in range(N):
+            start_idx = i * chunk_size
+            end_idx = (i + 1) * chunk_size if i < N - 1 else vertices.shape[1]
+            exterior[:, start_idx:end_idx] = winding_numbers(vertices[:, start_idx:end_idx, :], triangles).le(0.99)
+
 
         # check if intersections happen within segments
         if test_segments and not self.test_segments:
@@ -148,17 +168,18 @@ class SelfContact(nn.Module):
             for segm_name in self.segments.names:
                 segm_vids = self.segments.segmentation[segm_name].segment_vidx
                 for bidx in range(bs):
-                    if (exterior[bidx, segm_vids] == 0).sum() > 0:
+                    if (exterior[bidx, segm_vids] == 0).sum() > 0: # 该部位有顶点在内部
                         segm_verts = vertices[bidx, segm_vids, :].unsqueeze(0)
+                        # 该部位外部顶点
                         segm_ext = self.segments.segmentation[segm_name] \
                             .has_self_isect_points(
                                 segm_verts.detach(),
                                 triangles[bidx].unsqueeze(0)
                         )
                         mask = ~segm_ext[bidx]
-                        segm_idxs = torch.masked_select(segm_vids, mask)
+                        segm_idxs = torch.masked_select(segm_vids, mask) # 自交顶点的索引
                         true_tensor = torch.ones(segm_idxs.shape, device=segm_idxs.device, dtype=torch.bool)
-                        exterior[bidx, segm_idxs] = true_tensor
+                        exterior[bidx, segm_idxs] = true_tensor # 忽略这些自交顶点
 
         return exterior
 
@@ -189,28 +210,32 @@ class SelfContact(nn.Module):
 
     def segment_vertices(self, vertices, compute_hd=False, test_segments=True):
         """
-            get self-intersecting vertices and pairwise distance
+            get self-intersecting vertices and pairwise distance, 获取自交顶点和顶点间距离
         """
         bs = vertices.shape[0]
 
-        triangles = self.triangles(vertices.detach())
+        triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3]
 
+        # start = time.time()
         # get inside / outside segmentation
         exterior = self.get_intersection_mask(
                 vertices.detach(),
                 triangles.detach(),
                 test_segments
         )
+        # torch.cuda.synchronize()
+        # print('get intersection vertices: {:5f}'.format(time.time() - start))
 
         # get pairwise distances of vertices
-        v2v = self.get_pairwise_dists(vertices, vertices, squared=False)
+        v2v = self.get_pairwise_dists(vertices, vertices, squared=False) # [1, 10475, 10475] 每帧都计算？
+        # v2v.to(torch.float16)
         v2v_mask = v2v.detach().clone()
-        inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device)
-        v2v_mask[:, ~self.geomask] = inf_tensor
-        _, v2v_min_index = torch.min(v2v_mask, dim=1)
+        # inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # [1, 41639239] 不满足测地距离，设置顶点之间距离为inf
+        v2v_mask[:, ~self.geomask] = float('inf')# inf_tensor # 测地距离小的设置为Inf，避免计算
+        _, v2v_min_index = torch.min(v2v_mask, dim=1) # 每个顶点最近的顶点索引
         v2v_min = torch.gather(v2v, dim=2,
-            index=v2v_min_index.view(bs,-1,1)).squeeze(-1)
-        incontact = v2v_min < self.euclthres
+            index=v2v_min_index.view(bs,-1,1)).squeeze(-1) # 每个顶点最近的顶点之间的距离（唯一）
+        incontact = v2v_min < self.euclthres # [1, 10475] 接触Mask
 
         hd_v2v_min, hd_exterior, hd_points, hd_faces_in_contact = None, None, None, None
         if compute_hd:
@@ -225,6 +250,7 @@ class SelfContact(nn.Module):
 
     def segment_vertices_scopti(self, vertices, test_segments=True):
         """
+            指定是否过滤特定部位
             get self-intersecting vertices and pairwise distance 
             for self-contact optimization. This version is determinisic.
         """
@@ -236,20 +262,23 @@ class SelfContact(nn.Module):
         v2v = vertices.squeeze().unsqueeze(1).expand(nv, nv, 3) - \
                 vertices.squeeze().unsqueeze(0).expand(nv, nv, 3)
         v2v = torch.norm(v2v, dim=2).unsqueeze(0)
-
+        # v2v.to(torch.float16)
         with torch.no_grad():
             triangles = self.triangles(vertices.detach())
 
+            start = time.time()
             # get inside / outside segmentation
             exterior = self.get_intersection_mask(
                     vertices.detach(),
                     triangles.detach(),
                     test_segments
             )
+            # torch.cuda.synchronize()
+            # print('get intersection vertices: {:5f}'.format(time.time() - start))
 
             v2v_mask = v2v.detach().clone()
             #v2v_mask[:, ~self.geomask] = float('inf')
-            inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device)
+            inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # 不满足测地距离，设置顶点之间距离为inf
             v2v_mask[:, ~self.geomask] = inf_tensor
             _, v2v_min_index = torch.min(v2v_mask, dim=1)
 
@@ -259,8 +288,9 @@ class SelfContact(nn.Module):
 
         return (v2v_min, v2v_min_index, exterior)
 
-    def segment_points_scopti(self, points, vertices):
+    def segment_points_scopti_orig(self, points, vertices):
         """
+            只计算指定顶点是否穿模，默认不过滤特定部位
             get self-intersecting points (vertices on extremities) and pairwise distance
             for self-contact optimization. This version is determinisic.
         """
@@ -268,34 +298,219 @@ class SelfContact(nn.Module):
         if bs > 1:
             sys.exit('Please use batch size one or set use_pytorch_norm=False')
 
-        v2v = vertices.squeeze().unsqueeze(1).expand(nv, nv, 3) - \
-                vertices.squeeze().unsqueeze(0).expand(nv, nv, 3)
-        v2v = torch.norm(v2v, dim=2).unsqueeze(0)
-
+        start = time.time()
+        v2v = (vertices.squeeze().unsqueeze(1).expand(nv, nv, 3) - \
+                vertices.squeeze().unsqueeze(0).expand(nv, nv, 3)) # 6053->7308
+        v2v = torch.norm(v2v, dim=2).unsqueeze(0) # 已计算过？
+        print('get v2v distance: {:5f}'.format(time.time() - start))
+        
         # find closest vertex in contact
         with torch.no_grad():
-            triangles = self.triangles(vertices.detach())
+            triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3] 已计算过？
 
-            # get inside / outside segmentation
-            exterior = self.get_intersection_mask(
-                    vertices=points.detach(),
-                    triangles=triangles.detach(),
+            start = time.time()
+            # get inside / outside segmentation  # 7311 -> 6469
+            exterior = self.get_intersection_mask( # [1, 3889] 外部为True
+                    vertices=points.detach(), # 顶点 [3889, 3]
+                    triangles=triangles.detach(), # 面 [1, 20940, 3, 3]
                     test_segments=False
-            )
+            )            
+            # torch.cuda.synchronize()
+            print('get intersection vertices: {:5f}'.format(time.time() - start))
 
-            v2v_mask = v2v.detach().clone()
+            v2v_mask = v2v.detach().clone()# 6479 -> 6896
             #v2v_mask[:, ~self.geomask] = float('inf')
-            inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device)
+            inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # 6896 -> 7730
             v2v_mask[:, ~self.geomask] = inf_tensor
             _, v2v_min_index = torch.min(v2v_mask, dim=1)
 
         # first version is better, but not deterministic
         #v2v_min = torch.gather(v2v, dim=2,
         #    index=v2v_min_index.view(bs,-1,1)).squeeze(-1)
-        v2v_min = v2v[:, np.arange(nv), v2v_min_index[0]]
+        v2v_min = v2v[:, np.arange(nv), v2v_min_index[0]] # [1, 10475]
         
         return (v2v_min, v2v_min_index, exterior)
 
+    def segment_points_scopti_CHAT1(self, points, vertices):
+        """
+        get self-intersecting points (vertices on extremities) and pairwise distance
+        for self-contact optimization. This version is determinisic.
+        """
+        bs, nv, _ = vertices.shape
+        if bs > 1:
+            sys.exit('Please use batch size one or set use_pytorch_norm=False')
+
+        start = time.time()
+        v2v_min_list = []
+        v2v_min_index_list = []
+
+        for i in range(nv):
+            diff = vertices.squeeze() - vertices.squeeze()[i]
+            v2v = torch.norm(diff, dim=1)
+            v2v_min_index = torch.argmin(v2v)
+            v2v_min = v2v[v2v_min_index]
+            v2v_min_list.append(v2v_min)
+            v2v_min_index_list.append(v2v_min_index)
+
+        v2v_min = torch.tensor(v2v_min_list).unsqueeze(0)
+        v2v_min_index = torch.tensor(v2v_min_index_list).unsqueeze(0)
+
+        print('get v2v distance: {:5f}'.format(time.time() - start))
+
+        # find closest vertex in contact
+        with torch.no_grad():
+            triangles = self.triangles(vertices.detach())  # [1, 20940, 3, 3]
+
+            start = time.time()
+            # get inside / outside segmentation
+            exterior = self.get_intersection_mask(
+                vertices=points.detach(),  # 顶点 [3889, 3]
+                triangles=triangles.detach(),  # 面 [1, 20940, 3, 3]
+                test_segments=False
+            )
+            print('get intersection vertices: {:5f}'.format(time.time() - start))
+
+        return (v2v_min, v2v_min_index, exterior)
+    
+    def segment_points_scopti(self, points, vertices):
+        """
+            只计算指定顶点是否穿模，默认不过滤特定部位
+            get self-intersecting points (vertices on extremities) and pairwise distance
+            for self-contact optimization. This version is determinisic.
+        """
+        bs, nv, _ = vertices.shape
+        if bs > 1:
+            sys.exit('Please use batch size one or set use_pytorch_norm=False')
+
+        start = time.time()
+        # vertices = vertices.to(torch.float16)
+        # v2v = (vertices.squeeze().unsqueeze(1).expand(nv, nv, 3) - \
+        #         vertices.squeeze().unsqueeze(0).expand(nv, nv, 3)) # 6053->7308          600MB
+        # v2v = torch.norm(v2v, dim=2).unsqueeze(0) # 10475*10475*4 / (1024*1024) ，使用float16也要约418MB显存  400MB
+        # 计算两两顶点之间的欧式距离
+        v1 = vertices.unsqueeze(2)  # 添加一个维度，形状变为 (1, 10475, 1, 3)
+        v2 = vertices.unsqueeze(1)  # 添加一个维度，形状变为 (1, 1, 10475, 3)
+        v2v = torch.norm(v1 - v2, dim=-1)  # 计算欧式距离，dim=-1 表示沿着最后一个维度计算
+        
+        # print('get v2v distance: {:5f}'.format(time.time() - start))
+        
+        # find closest vertex in contact
+        with torch.no_grad():
+            triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3] 已计算过？
+
+            # start = time.time()
+            # get inside / outside segmentation  # 7311 -> 6469
+            exterior = self.get_intersection_mask( # [1, 3889] 外部为True
+                    vertices=points.detach(), # 顶点 [3889, 3]
+                    triangles=triangles.detach(), # 面 [1, 20940, 3, 3]
+                    test_segments=False
+            )            
+            # torch.cuda.synchronize()
+            # print('get intersection vertices: {:5f}'.format(time.time() - start))
+
+            v2v_mask = v2v.detach().clone() # 6479 -> 6896
+            #v2v_mask[:, ~self.geomask] = float('inf')
+            # inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # 6896 -> 7730
+            v2v_mask[:, ~self.geomask] = float('inf')# inf_tensor
+            _, v2v_min_index = torch.min(v2v_mask, dim=1)
+            v2v_min_index.to(torch.int16)
+        # first version is better, but not deterministic
+        # v2v_min = torch.gather(v2v, dim=2,
+        #    index=v2v_min_index.view(bs,-1,1)).squeeze(-1)
+        
+        # v2v = v2v.to(torch.float16)
+        v2v_min = v2v[:, np.arange(nv), v2v_min_index[0]] # [1, 10475]
+        return (v2v_min, v2v_min_index, exterior)
+        # return v2v_min
+       
+    def segment_points_scopti_ds(self, ds, ds_vertices, vertices):
+        nv_ds = ds.shape[0] # ds中顶点的数量
+        # ds_vertices_flat = ds_vertices.view(-1, 3)
+        # # ds_vertices_flat = points.view(-1, 3)
+        # vertices_flat = vertices.view(-1, 3)
+
+        # 计算顶点之间的距离差的平方
+        # ds_vertices_flat_expanded = ds_vertices_flat.unsqueeze(1)  # 形状变为[460, 1, 3]
+        # vertices_flat_expanded = vertices_flat.unsqueeze(0)        # 形状变为[1, 10475, 3]
+        v2v_ds = torch.norm(ds_vertices.view(-1, 3).unsqueeze(1) - vertices.view(-1, 3).unsqueeze(0), dim=2)
+        # distances_squared = ((ds_vertices_flat.unsqueeze(1) - vertices_flat.unsqueeze(0)) ** 2).sum(dim=2)
+        # # 计算距离的平方根
+        # v2v_ds = torch.sqrt(distances_squared)
+        
+        with torch.no_grad():
+            triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3] 已计算过？
+
+            # start = time.time()
+            # get inside / outside segmentation  # 7311 -> 6469
+            exterior = self.get_intersection_mask( # [1, 3889] 外部为True
+                    vertices=ds_vertices.detach(), # 顶点 [3889, 3]
+                    triangles=triangles.detach(), # 面 [1, 20940, 3, 3]
+                    test_segments=False
+            )            
+            # torch.cuda.synchronize()
+            # print('get intersection vertices: {:5f}'.format(time.time() - start))
+
+            ds_geomask = self.geomask[ds] # ds中满足测地距离 [460, 10475]
+            v2v_ds_mask = v2v_ds.detach().clone()
+            v2v_ds_mask[~ds_geomask] = float('inf') # [460, 10475]
+            _, v2v_ds_min_index = torch.min(v2v_ds_mask, dim=1) # 没有grad_fn=<IndexBackward>
+        v2v_ds_min = v2v_ds[np.arange(nv_ds), v2v_ds_min_index] # [1, 10475] 多了个grad_fn=<IndexBackward>
+        
+        return (v2v_ds_min, v2v_ds_min_index, exterior)
+    
+    def get_hand_vertices_min(self, hand_idx, hand_vertices, vertices):
+        """
+            手部顶点对应的最短距离
+        """
+        nv_hand = hand_idx.shape[0] # ds中顶点的数量
+        v2v_hand = torch.norm(hand_vertices.view(-1, 3).unsqueeze(1) - vertices.view(-1, 3).unsqueeze(0), dim=2)
+        with torch.no_grad():
+            ds_geomask = self.geomask[hand_idx] # ds中满足测地距离 [460, 10475]
+            v2v_hand_mask = v2v_hand.detach().clone()
+            v2v_hand_mask[~ds_geomask] = float('inf') # [460, 10475]
+            _, v2v_hand_min_index = torch.min(v2v_hand_mask, dim=1)
+        v2v_hand_min = v2v_hand[np.arange(nv_hand), v2v_hand_min_index]
+        return v2v_hand_min
+    
+    def segment_points_scopti_KIMI(self, points, vertices):
+        """
+            get self-intersecting points (vertices on extremities) and pairwise distance
+            for self-contact optimization. This version is deterministic.
+        """
+        bs, nv, _ = vertices.shape
+        if bs > 1:
+            sys.exit('Please use batch size one or set use_pytorch_norm=False')
+
+        start = time.time()
+        # 计算顶点之间的距离矩阵，避免重复计算
+        vertices_expanded = vertices.clone().detach().squeeze().unsqueeze(1).expand(nv, nv, 3)
+        v2v = torch.norm(vertices_expanded - vertices_expanded.transpose(0, 1), dim=2).unsqueeze(0)
+        print('get v2v distance: {:5f}'.format(time.time() - start))
+
+        with torch.no_grad():
+            triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3]
+
+            start = time.time()
+            # 使用更小的数据类型，如果精度要求允许
+            exterior = self.get_intersection_mask(
+                vertices=points.detach().float(), # 顶点 [3889, 3]
+                triangles=triangles.detach(),
+                test_segments=False
+            )
+            print('get intersection vertices: {:5f}'.format(time.time() - start))
+
+            # 减少中间变量的存储，直接在 v2v 上操作
+            v2v_mask = v2v.cpu().clone().detach()
+            v2v_mask[:, ~self.geomask] = float('inf')
+            _, v2v_min_index = torch.min(v2v_mask, dim=1)
+
+            # 使用 in-place 操作减少内存使用
+            v2v_min = v2v[:, np.arange(nv), v2v_min_index[0]].clamp_min_(0) # [1, 10475]
+
+        del v2v_mask, v2v  # 释放不再使用的变量
+
+        return (v2v_min, v2v_min_index, exterior)
+    
     def segment_hd_points(self, vertices, v2v_min, incontact, exterior, test_segments=True):
         """
             compute hd points from vertices and compute their distance

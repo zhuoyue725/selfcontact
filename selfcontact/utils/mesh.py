@@ -55,7 +55,7 @@ def compute_vertex_normals(vertices, faces):
     bs, nf = faces.shape[:2]
     device = vertices.device
     normals = torch.zeros(bs * nv, 3).to(device)
-    faces = faces + (torch.arange(bs).to(device) * nv)[:, None, None] # expanded faces
+    faces = faces.to(device) + (torch.arange(bs).to(device) * nv)[:, None, None] # expanded faces
     vertices_faces = vertices.reshape((bs * nv, 3))[faces.long()]
 
     faces = faces.view(-1, 3)
@@ -96,7 +96,7 @@ def batch_index_select(inp, dim, index):
     return torch.gather(inp, dim, index)
 
 
-def batch_pairwise_dist(x, y, use_cuda=True, squared=True):
+def batch_pairwise_dist(x, y, use_cuda=False, squared=True):
 
     bs, num_points_x, points_dim = x.size()
     _, num_points_y, _ = y.size()

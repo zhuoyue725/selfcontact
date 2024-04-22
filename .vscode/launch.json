@@ -5,11 +5,87 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Current File",
-            "type": "python",
+            "name": "vertices in contact",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal"
+            "program": "${workspaceFolder}/selfcontact/tutorial/find_vertices_in_contact.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--essentials_folder",
+                "./selfcontact-essentials",
+                "--output_folder",
+                "./output"
+            ]
+        },
+        {
+            "name": "intersecting vertices",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/selfcontact/tutorial/find_self_intersecting_vertices.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--essentials_folder",
+                "./selfcontact-essentials",
+                "--output_folder",
+                "./output"
+            ]
+        },
+        {
+            "name": "self-contact optimization animation",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/selfcontact/tutorial/run_selfcontact_optimization_anim.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--essentials_folder",
+                "./selfcontact-essentials",
+                "--model_folder", // smplx的基准模型文件夹
+                "/usr/pydata/t2m/selfcontact/model/models",
+                // "selfcontact-essentials/hd_model/smpl/smpl_neutral_hd_vert_regressor_sparse.npz",
+                "--input_file",  // 需要修正的pose的npz文件
+                // "./selfcontact-essentials/example_poses/pose1.npz",
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/recon_000_30fps.npz", 
+                // "/usr/pydata/t2m/selfcontact/output/pen_and_smooth/recon_000_30fps_36.npz", // 40 - 50
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/walk circle.npz", // 8
+                "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/lie up.npz", // 23 - 45
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/idle.npz", // 105 
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/ballet dance.npz", // 167 - 182  174左右效果不好
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/fold arms.npz", // 25 - 70
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/picks sth.npz", // 102 - 117
+                "--output_folder",
+                "./output/single",
+                // "--find_intersect_only"
+                // "--assign_frame_idx",
+                // "29"
+                "--frame_start",
+                "22",
+                "--frame_end",
+                "44",
+            ]
+        },
+        {
+            "name": "v0 self-contact optimization",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/selfcontact/tutorial/run_selfcontact_optimization.py",
+            "console": "integratedTerminal",
+            // "cwd": "${workspaceFolder}",
+            "args": [
+                "--essentials_folder",
+                "./selfcontact-essentials",
+                "--model_folder", // smplx的基准模型文件夹
+                "/usr/pydata/t2m/selfcontact/model/models",
+                // "selfcontact-essentials/hd_model/smpl/smpl_neutral_hd_vert_regressor_sparse.npz",
+                "--input_file", // 需要修正的pose的npz文件
+                "./selfcontact-essentials/example_poses/pose1.npz",
+                // "/usr/pydata/t2m/torch-mesh-isect/assets/npz_file/bvh2npz/fold arms.npz",
+                "--output_folder",
+                "./output/tmp",
+                // "--find_intersect_only"
+                // "--assign_frame_idx",
+                // "5"
+            ]
         }
     ]
 }

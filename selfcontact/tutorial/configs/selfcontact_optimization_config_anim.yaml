@@ -1,0 +1,25 @@
+batch_size: 1
+body_model:
+  model_type: smplx
+  num_pca_comps: 12
+contact:
+  euclidean_thres: 0.03 # 判定为接触的距离
+  geodesic_thres: 0.3
+  test_segments: False
+loss:
+  contact_weight: 5 # 10 # 30 外部推向内部
+  inside_weight: 30 # 内部到表面
+  outside_weight: 0.001 # 0.001 与初始状态vert接近
+  hand_contact_prior_weight: 1.0 # 1.0
+  pose_prior_weight: 1.0  # 1.0  与初始状态pose接近
+  hand_pose_prior_weight: 0.01 #0.01 偏离平均手姿势
+  angle_weight: 0.001 # 0.001
+  smooth_weight: 0.01 # 0.001
+  smooth_verts_weight: 0.01 # 0.01
+optimizer:
+  name: adam
+  learning_rate_body: 0.01
+  learning_rate_hands: 0.01
+  max_iters: 200
+fps: 30
+save_step: 20

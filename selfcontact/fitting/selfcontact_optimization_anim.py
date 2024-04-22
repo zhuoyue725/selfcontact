@@ -21,10 +21,10 @@ import os
 import numpy as np
 
 from ..utils.output import printlosses
-# from ..utils.visualization import save_smplx_mesh_index
+from ..utils.visualization import save_npz_file
 import time
 
-class SelfContactOpti():
+class SelfContactAnimOpti():
     def __init__(
         self,
         loss,
@@ -34,7 +34,11 @@ class SelfContactOpti():
         max_iters=100,
         loss_thres=1e-5,
         patience=5,
-
+        output_folder=None,
+        npz_file=None,
+        file_base_name = None,
+        save_step = 10,
+        cfg = None
     ):
         super().__init__()
 
@@ -48,7 +52,16 @@ class SelfContactOpti():
 
         # self-contact optimization loss
         self.loss = loss
-
+        
+        # save animation tmp result
+        self.output_folder = output_folder
+        self.npz_file = npz_file
+        self.file_base_name = file_base_name
+        
+        self.save_step = save_step
+        
+        self.cfg = cfg
+        
     def get_optimizer(self, model):
         if self.optimizer_name == 'adam':
             optimizer = torch.optim.Adam([
@@ -57,24 +70,38 @@ class SelfContactOpti():
             ])
         return optimizer
 
-    def run(self, body_model, params):
+    def get_anim_optimizer(self, total_body_model):
+        if self.optimizer_name == 'adam':
+            # optimizer = torch.optim.Adam([
+            #     {'params': [cur_body.body_pose for cur_body in total_body_model], 'lr': self.optimizer_lr_body}
+            #     # {'params': [[cur_body.left_hand_pose, cur_body.right_hand_pose] for cur_body in total_body_model], 'lr': self.optimizer_lr_hands},
+            # ])
+            optimizer = torch.optim.Adam([cur_body.body_pose for cur_body in total_body_model], lr=self.optimizer_lr_body)
+        return optimizer
+    
+    def run(self, total_body_model, params, assign_frame_idx = -1):
 
         # create optimizer 
-        optimizer = self.get_optimizer(body_model)
-
+        optimizer = self.get_anim_optimizer(total_body_model)
+        
+        # initial total body
+        # body = body_model(
+        #     get_skin=True,
+        #     global_orient=params['global_orient'],
+        #     betas=params['betas']
+        # )
+        total_output_body_mesh = [cur_body(
+            get_skin=True,
+            global_orient=params['global_orient'],
+            betas=params['betas'] # 所有帧都相同
+        ) for cur_body in total_body_model]
+        
         print('start configure loss with initial mesh')
         start = time.time()
         # configure loss with initial mesh
-        self.loss.configure(body_model, params)
+        self.loss.configure(total_body_model, total_output_body_mesh) # 2529 -> 4876
         # torch.cuda.synchronize()
         print('configure loss with initial mesh: {:5f}'.format(time.time() - start))
-        
-        # initial body
-        body = body_model(
-            get_skin=True,
-            global_orient=params['global_orient'],
-            betas=params['betas']
-        )
         
         # Initialize optimization
         step = 0
@@ -88,15 +115,22 @@ class SelfContactOpti():
             start_step = time.time()
             optimizer.zero_grad()
 
-            # get current model
-            body = body_model(
+            # get current total model
+            total_output_body_mesh = [cur_body(
                 get_skin=True,
                 global_orient=params['global_orient'],
-                betas=params['betas']
-            )
+                betas=params['betas'] # 所有帧都相同
+            ) for cur_body in total_body_model]
 
             # compute loss
-            total_loss, loss_dict = self.loss(body)
+            if assign_frame_idx >=0 and (step % 10 == 0 or step == self.max_iters-1):
+                total_loss, loss_dict = self.loss(total_output_body_mesh,total_body_model[0])
+            elif assign_frame_idx < 0 and (step % self.save_step == 0 or step == self.max_iters-1) and step > 0:
+                save_npz_file(self.output_folder, self.npz_file, total_output_body_mesh, self.file_base_name, self.cfg)
+                total_loss, loss_dict = self.loss(total_output_body_mesh)
+            else:
+                total_loss, loss_dict = self.loss(total_output_body_mesh)
+                
             print(step, printlosses(loss_dict))
 
             # =========== stop criterion based on loss ===========
@@ -106,12 +140,15 @@ class SelfContactOpti():
                     criterion_loss = False
 
                 loss_old = total_loss
-                print('Step Optimization: {:5f}'.format(time.time() - start_step))
+                
                 step += 1
 
             # back prop
             total_loss.backward(retain_graph=False)
+            # for i in range(11):
+            #     print(total_output_body_mesh[i].body_pose.grad)
             optimizer.step()
+            torch.cuda.empty_cache()
+            print('Step Optimization: {:5f}'.format(time.time() - start_step))
 
-        return body
-
+        return total_output_body_mesh # 蒙皮后的bodys

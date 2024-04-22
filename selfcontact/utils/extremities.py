@@ -24,3 +24,16 @@ def get_extremities(segmentation_path, include_toes=False):
     extremities = torch.tensor(extremities)
 
     return extremities
+
+def get_extremities_assign_bones(segmentation_path, smplx_extremities_assign_nums, include_toes=False):
+
+    # extrimities vertex IDs
+    smpl_bone_vert = np.load(segmentation_path)
+
+    extremities = np.where(np.isin(smpl_bone_vert, smplx_extremities_assign_nums))[0]
+    # ignore inner toe vertices by default
+    if not include_toes:
+        extremities = extremities[~np.isin(extremities, smplx_inner_toes)]
+    extremities = torch.tensor(extremities)
+
+    return extremities

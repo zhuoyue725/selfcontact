@@ -28,15 +28,14 @@ def save_mesh(mesh, verts_exterior, path='mesh_out.obj'):
 
     # color vertices inside red, outside green
     color = np.array(mesh.visual.vertex_colors)
-    color[~verts_exterior_np[0], :] = [255, 0, 0, 255]
-    color[verts_exterior_np[0], :] = [233, 233, 233, 255]
+    color[~verts_exterior_np[0], :] = [255, 0, 0, 255] # 内部红色
+    color[verts_exterior_np[0], :] = [0, 255, 0, 255]# [233, 233, 233, 255] # 外部绿色
     mesh.visual.vertex_colors = color
 
     # export mesh
     mesh.export(path)
 
-def main(args):
-
+def main(args):    
     # process arguments
     ESSENTIALS_DIR = args.essentials_folder    
     MODEL_TYPE = args.model_type

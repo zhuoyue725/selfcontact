@@ -23,6 +23,8 @@ import numpy as np
 from ..utils.prior import L2Prior
 from ..utils.mesh import compute_vertex_normals
 
+import time
+
 class SelfContactOptiLoss(nn.Module):
     def __init__(self,
         contact_module,
@@ -88,18 +90,20 @@ class SelfContactOptiLoss(nn.Module):
         self.cm = contact_module
         self.geodist = self.cm.geodesicdists
 
-    def configure(self, body_model, params):
+    def configure(self, body_model, params): # 耗时有时会崩
 
         # initial mesh and pose 
+        print("registering buffers")
         vertices = body_model(**params).vertices
         self.register_buffer('init_pose', body_model.body_pose.clone().detach())
         self.register_buffer('init_verts', vertices.clone().detach())
 
         # get verts in contact in initial mesh
+        print("init_verts_in_contact_idx")
         with torch.no_grad():
             self.init_verts_in_contact_idx = \
-                self.cm.segment_vertices(self.init_verts, test_segments=False)[0][1][0]
-            self.init_verts_in_contact = torch.where(self.init_verts_in_contact_idx)[0].cpu().numpy()
+                self.cm.segment_vertices(self.init_verts, test_segments=False)[0][1][0]  # [10475] Mask 接触状态为True，此处保存初始的接触状态
+            self.init_verts_in_contact = torch.where(self.init_verts_in_contact_idx)[0].cpu().numpy() # [824] 接触状态的顶点索引
 
     def forward(self, body):
         """
@@ -126,7 +130,7 @@ class SelfContactOptiLoss(nn.Module):
 
         if self.test_segments:
             v2v_min, v2v_min_idx, exterior \
-                = self.cm.segment_vertices_scopti(
+                = self.cm.segment_vertices_scopti( # test_segments是只取指定segments的顶点？
                 vertices=vertices,
                 test_segments=self.test_segments,
             )
@@ -134,17 +138,19 @@ class SelfContactOptiLoss(nn.Module):
             exterior = exterior[:,self.ds]
         else:
             v2v_min, v2v_min_idx, exterior = self.cm.segment_points_scopti(
-                points=vertices[:, self.ds, :],
+                points=vertices[:, self.ds, :], # ds是仅手部？
                 vertices=vertices
             )
-        v2v_min = v2v_min.squeeze()
-
+        v2v_min = v2v_min.squeeze() # [10475]
+        
+        start_time = time.time()
         # only extremities intersect
         inside = torch.zeros(nv).to(device).to(torch.bool)
         # rewritten, because of pytorch bug when torch.use_deterministic_algorithms(True)
         true_tensor = torch.ones((~exterior[0]).sum().item(), device=device, dtype=torch.bool)
         inside[self.ds[~exterior[0]]] = true_tensor
-
+        # print((inside==True).sum())
+        # save_smplx_model(model,body,~inside,"./output/iteration")
         # ==== contact loss ====
         # pull outside together
         if (~inside).sum() > 0:
@@ -232,4 +238,5 @@ class SelfContactOptiLoss(nn.Module):
             'BodyPosePrior': pose_prior_loss.item(),
         }
 
+        print("Time taken for Loss: ", time.time()-start_time)
         return loss, loss_dict

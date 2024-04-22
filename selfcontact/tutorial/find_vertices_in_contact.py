@@ -14,6 +14,9 @@
 #
 # Contact: ps-license@tuebingen.mpg.de
 
+import sys
+sys.path.append('/usr/pydata/t2m/selfcontact')
+
 from selfcontact import SelfContact
 import torch 
 import trimesh 
@@ -62,8 +65,9 @@ def main(args):
     mesh = trimesh.load(OBJ_FILE, process=False)
     vertices = torch.from_numpy(mesh.vertices) \
                     .unsqueeze(0) \
-                    .to(DEVICE) \
                     .float()
+                    # .to(DEVICE) \
+
 
 
     # Segment mesh into inside and outside vertices
@@ -74,7 +78,7 @@ def main(args):
         test_segments=False)
 
     save_mesh(mesh, verts_incontact, 
-        osp.join(OUTPUT_DIR, f'{MESH_FN}.obj'))
+        osp.join(OUTPUT_DIR, f'{MESH_FN}sd.obj'))
 
 if __name__ == "__main__":
 
