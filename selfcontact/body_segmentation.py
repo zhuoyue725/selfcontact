@@ -117,8 +117,8 @@ class BodySegment(nn.Module):
         """
             check if points on segment are self intersecting.
         """
-        smplx_verts = triangles[:,self.tri_vidx[:,0], self.tri_vidx[:,1],:]
-        segm_triangles = self.get_closed_segment(smplx_verts)
+        smplx_verts = triangles[:,self.tri_vidx[:,0], self.tri_vidx[:,1],:] # [1, 10475 ,3]
+        segm_triangles = self.get_closed_segment(smplx_verts) # [1, 9706, 3, 3] 闭合的mesh三角形
 
         # do inside outside segmentation
         exterior = winding_numbers(points, segm_triangles) \

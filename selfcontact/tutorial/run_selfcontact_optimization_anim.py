@@ -33,9 +33,10 @@ from selfcontact.losses import SelfContactOptiAnimAssignLoss
 from selfcontact.fitting import SelfContactAnimOpti
 from selfcontact.utils.parse import DotConfig
 from selfcontact.utils.body_models import get_bodymodels
-from selfcontact.utils.extremities import get_extremities,get_extremities_assign_bones
-from selfcontact.utils.visualization import save_smplx_mesh_bool,save_smplx_mesh_index,save_npz_file
+from selfcontact.utils.extremities import get_extremities,get_extremities_assign_bones,smplx_extremities_nums,get_vertices_assign_bone
+from selfcontact.utils.visualization import save_smplx_mesh_with_obb, save_npz_file
 from selfcontact.utils.SMPLXINFO import *
+from selfcontact.utils.obb import build_obb
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.deterministic = True
 
@@ -164,6 +165,7 @@ def load_model_param(npz_file, cfg, device='cuda'):
     
     params['body_pose'] = params['body_pose'].unsqueeze(0)
     params['global_orient'] = params['global_orient'].unsqueeze(0)
+    
     return total_body_mesh, params
 
 def main(cfg):
@@ -201,32 +203,20 @@ def main(cfg):
         buffer_geodists=True,
     ).to(device) # 479 -> 1664->(no buffer_geodists) 1195
 
-    # extremities = get_extremities(
-    #     SEGMENTATION_PATH, 
-    #     cfg.contact.test_segments
-    # )
-    
+    if cfg.LowerBody:
+        extremities_body_segment = LEFT_RIGHT_LEG_INDEX_55
+        extremities_index_21 = LEFT_RIGHT_LEG_INDEX_21
+    elif cfg.FullBody:
+        extremities_body_segment = smplx_extremities_nums
+        extremities_index_21 = range(21)
+    else:
+        extremities_body_segment = LEFT_RIGHT_ARM_INDEX_55
+        extremities_index_21 = LEFT_RIGHT_ARM_INDEX_21
     extremities = get_extremities_assign_bones(
         SEGMENTATION_PATH, 
-        # LEFT_RIGHT_LEG_INDEX_55,
-        LEFT_RIGHT_ARM_INDEX_55,
+        extremities_body_segment,
         cfg.contact.test_segments
     )
-    # criterion = SelfContactOptiLoss( 
-    #     contact_module=sc_module,
-    #     inside_loss_weight=cfg.loss.inside_weight,
-    #     outside_loss_weight=cfg.loss.outside_weight,
-    #     contact_loss_weight=cfg.loss.contact_weight,
-    #     hand_contact_prior_weight=cfg.loss.hand_contact_prior_weight,
-    #     pose_prior_weight=cfg.loss.pose_prior_weight,
-    #     hand_pose_prior_weight=cfg.loss.hand_pose_prior_weight,
-    #     angle_weight=cfg.loss.angle_weight,
-    #     hand_contact_prior_path=HCP_PATH,
-    #     downsample=extremities,
-    #     use_hd=False,
-    #     test_segments=cfg.contact.test_segments,
-    #     device=device
-    # )
     
     criterion = SelfContactOptiAnimAssignLoss( 
         contact_module=sc_module,
@@ -237,8 +227,9 @@ def main(cfg):
         pose_prior_weight=cfg.loss.pose_prior_weight,
         hand_pose_prior_weight=cfg.loss.hand_pose_prior_weight,
         angle_weight=cfg.loss.angle_weight,
-        smooth_weight=cfg.loss.smooth_weight,
+        smooth_angle_weight=cfg.loss.smooth_angle_weight,
         smooth_verts_weight=cfg.loss.smooth_verts_weight,
+        smooth_joints_weight=cfg.loss.smooth_joints_weight,
         hand_contact_prior_path=HCP_PATH,
         downsample=extremities,
         use_hd=False,
@@ -249,17 +240,10 @@ def main(cfg):
         frame_end=cfg.frame_end,
         frame_num=cfg.frame_end - cfg.frame_start + 1,
         cfg=cfg,
-        file_base_name=file_base_name
+        file_base_name=file_base_name,
+        extremities_index_21=extremities_index_21,
     )
 
-    # scopti = SelfContactOpti( # 单帧优化
-    #     loss=criterion,
-    #     optimizer_name=cfg.optimizer.name,
-    #     optimizer_lr_body=cfg.optimizer.learning_rate_body,
-    #     optimizer_lr_hands=cfg.optimizer.learning_rate_hands,
-    #     max_iters=cfg.optimizer.max_iters,
-    # )
-    
     anim_opti = SelfContactAnimOpti(
         loss=criterion,
         optimizer_name=cfg.optimizer.name,
@@ -276,8 +260,6 @@ def main(cfg):
     # model = models[gender]
     total_body_model, params = load_model_param(npz_file,cfg,device) # 1642 -> 2536
     
-    # model.reset_params(**params)
-
     start_optim = time.time()
     total_output_body_mesh = anim_opti.run(total_body_model, params,cfg.assign_frame_idx)
     print('Total Optimization: {:5f}'.format(time.time() - start_optim))
@@ -316,6 +298,10 @@ if __name__ == "__main__":
                         help='frame start index.')
     parser.add_argument('--frame_end', default=10, type=int,
                         help='frame end index.')
+    parser.add_argument('--LowerBody', action='store_true',default=False,
+                        help='LowerBody or not.')
+    parser.add_argument('--FullBody', action='store_true',default=False,
+                        help='FullBody or not.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as stream:

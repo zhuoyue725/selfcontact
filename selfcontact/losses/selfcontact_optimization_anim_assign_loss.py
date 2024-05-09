@@ -23,7 +23,9 @@ from selfcontact import SelfContact
 import numpy as np
 from ..utils.prior import L2Prior
 from ..utils.mesh import compute_vertex_normals
-from ..utils.visualization import save_smplx_mesh_bool
+from ..utils.visualization import save_smplx_mesh_bool,save_smplx_mesh_with_obb,save_smplx_mesh_bone
+from ..utils.extremities import get_vertices_assign_bone,get_connected_faces
+from ..utils.obb import build_obb
 from ..utils.SMPLXINFO import *
 import time
 
@@ -37,7 +39,8 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         pose_prior_weight,
         hand_pose_prior_weight,
         angle_weight,
-        smooth_weight,
+        smooth_angle_weight,
+        smooth_joints_weight,
         smooth_verts_weight,
         hand_contact_prior_path,
         downsample,
@@ -58,6 +61,7 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         frame_end=10,
         cfg = None,
         file_base_name = 'result',
+        extremities_index_21 = list(range(21)),
     ):
         super().__init__()
 
@@ -73,8 +77,9 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         self.pose_prior_weight = pose_prior_weight
         self.hand_pose_prior_weight = hand_pose_prior_weight
         self.angle_weight = angle_weight 
-        self.smooth_weight = smooth_weight 
+        self.smooth_angle_weight = smooth_angle_weight 
         self.smooth_verts_weight = smooth_verts_weight
+        self.smooth_joints_weight = smooth_joints_weight
         
         # hyper params
         self.a1 = alpha1
@@ -110,12 +115,15 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         
         self.cfg = cfg
         self.file_base_name = file_base_name
+        
+        self.mse_loss = nn.MSELoss(reduction='sum').to(device=device)
+        self.extremities_index_21 = extremities_index_21
 
     def configure(self, total_body_model, total_output_body_mesh):
         if self.contact_w <= 0 and self.outside_w <= 0: # 减少占用内存
             return
-        self.init_poses = []
-        self.init_verts = []
+        init_poses = []
+        init_verts = []
         init_verts_in_contact_idx = []
         self.init_verts_in_contact = []
 
@@ -124,19 +132,19 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
             # print(f"registering buffers for body_model {i}")
             # vertices = body_model(**params).vertices 
             vertices = total_output_body_mesh[i].vertices # 不用蒙皮，已经计算
-            self.init_poses.append(body_model.body_pose.clone().detach())# .to(torch.float16)
-            self.init_verts.append(vertices.clone().detach()) # .to(torch.float16)
+            init_poses.append(body_model.body_pose.clone().detach())# .to(torch.float16)
+            init_verts.append(vertices.clone().detach()) # .to(torch.float16)
 
             # print(f"init_verts_in_contact_idx for body_model {i}")
             with torch.no_grad():
-                init_verts_in_contact_idx.append(self.cm.segment_vertices(self.init_verts[i], test_segments=False)[0][1][0].clone().detach()) # [10475] Mask 接触状态为True，此处保存初始的接触状态
-                self.init_verts_in_contact.append(torch.where(init_verts_in_contact_idx[i])[0].cpu().clone().detach().numpy()) # [824] 接触状态的顶点索引
+                init_verts_in_contact_idx.append(self.cm.segment_vertices(init_verts[i], test_segments=False)[0][1][0]) # [10475] Mask 接触状态为True，此处保存初始的接触状态
+                self.init_verts_in_contact.append(torch.where(init_verts_in_contact_idx[i])[0].cpu().numpy()) # [824] 接触状态的顶点索引
                 # init_verts_in_contact.append(torch.where(init_verts_in_contact_idx[i])[0].clone().detach()) # [824] 接触状态的顶点索引
                 # torch.cuda.empty_cache()
 
         # 将数据注册为二维数组
-        # self.register_buffer('init_poses', torch.stack(init_poses))
-        # self.register_buffer('init_verts', torch.stack(init_verts))
+        self.register_buffer('init_poses', torch.stack(init_poses))
+        self.register_buffer('init_verts', torch.stack(init_verts))
         # self.register_buffer('init_verts_in_contact_idx', torch.stack(init_verts_in_contact_idx))
         # self.register_buffer('init_verts_in_contact', np.stack(init_verts_in_contact))
     
@@ -148,7 +156,7 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         # initialize loss tensors
         device = body.vertices.device
         vertices = body.vertices
-        # vertices = vertices.to(torch.float16)
+        vertices = vertices.to(torch.float16)
         _, nv, _ = vertices.shape
 
         loss = torch.tensor(0.0, device=device, requires_grad=True) # torch.float16
@@ -197,7 +205,7 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
             ) 
         # v2v_min = v2v_min.squeeze() # [10475]
         
-        # torch.cuda.empty_cache() # 清理缓存
+        torch.cuda.empty_cache() # 清理缓存
 
         # 获取GPU显存的总量和已使用量
         # used_memory = torch.cuda.memory_allocated(torch.cuda.current_device()) / (1024 ** 3)  # 已使用显存(GB)
@@ -210,7 +218,38 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         inside[self.ds[~exterior[0]]] = true_tensor
 
         if model is not None:
-            save_smplx_mesh_bool(model, body,~inside, file_name = self.file_base_name, cfg = self.cfg)
+            pass
+            # 测试: 生成OBB盒
+            SEGMENTATION_PATH = '/usr/pydata/t2m/selfcontact/selfcontact-essentials/models_utils/smplx/smplx_segmentation_id.npy'
+            for bone_idx in range(55):
+                vert_idx = get_vertices_assign_bone(SEGMENTATION_PATH, bone_idx)
+                box_verts, box_face = build_obb(vertices[:, vert_idx, :].squeeze(0))
+                # target_faces = []
+                # for face in self.cm.faces:
+                #     if(face[0].item() in vert_idx and face[1].item() in vert_idx and face[2].item() in vert_idx):
+                #         target_faces.append(np.array(face.cpu()))
+                # target_faces = np.array(target_faces)
+                
+                bound_faces = []
+                inner_faces = []
+                for face in self.cm.faces:
+                    count = sum(1 for vertex in face if vertex.item() in vert_idx) # 两个顶点在该部位，认为是边界三角形
+                    if count == 2:
+                        bound_faces.append(np.array(face.cpu()))
+                    if count == 3:
+                        inner_faces.append(np.array(face.cpu()))
+                bound_faces = np.array(bound_faces)
+                inner_faces = np.array(inner_faces)
+                
+                verts_with_bone_close, face_with_bone_close = get_connected_faces(vertices, bound_faces, self.cm.faces) # list
+                # bound_faces = self.cm.get_connected_faces() # list
+                # inner_and_bound_faces = np.concatenate((bound_faces, face_with_bone_close), axis=0)
+                if len(face_with_bone_close) > 0:
+                    inner_and_bound_faces = np.concatenate((inner_faces, face_with_bone_close), axis=0)
+                save_smplx_mesh_bone(verts_with_bone_close, inner_and_bound_faces, file_name = self.file_base_name, cfg = self.cfg)
+            # save_smplx_mesh_with_obb(model, body, box_verts, box_face, file_name = self.file_base_name, cfg = self.cfg)
+            # save_smplx_mesh_bool(model, body,~inside, file_name = self.file_base_name, cfg = self.cfg)
+            
         # ==== contact loss ==== 内部or外部接触损失
         # pull outside together
         if self.contact_w > 0 and (~inside).sum() > 0:
@@ -345,13 +384,14 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         # vertices = total_body[0].vertices
         # _, nv, _ = vertices.shape
         
-        loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        selfcontact_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        smooth_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        smooth_verts_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        loss = torch.tensor(0.0, device=device)
+        selfcontact_loss = torch.tensor(0.0, device=device)
+        smooth_angle_loss = torch.tensor(0.0, device=device)
+        smooth_verts_loss = torch.tensor(0.0, device=device)
+        smooth_joints_loss = torch.tensor(0.0, device=device)
         
         loss_dict_total = {
-            'Total': loss.item(),
+            'Total': 0,
             'Contact': 0,
             'Inside': 0,
             'Outside': 0,
@@ -359,35 +399,42 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
             'HandContact': 0,
             'HandPosePrior':0,
             'BodyPosePrior': 0,
-            'Smooth': smooth_loss.item(),
-            'SmoothVerts': smooth_verts_loss.item(),
+            'SmoothAngle': 0,
+            'SmoothVerts': 0,
+            'SmoothJoints': 0,
         }
         
-        # start_time = time.time()
-        
+        # 1.单帧优化       
+        start_time = time.time()
         for idx, body in enumerate(total_body):
-            sc_loss, loss_dict = self.single_forward(idx, body, mesh) # 每帧自己的loss
+            sc_loss, loss_dict = self.single_forward(idx, body, mesh)
             selfcontact_loss += sc_loss
             for key in loss_dict:
                 loss_dict_total[key] += loss_dict[key]
         selfcontact_loss = selfcontact_loss / len(total_body)
         for key in loss_dict:
             loss_dict_total[key] /= len(total_body)
-        # print("calculate selfcontact loss: ", time.time()-start_time)
+        print('single_forward: {:5f}'.format(time.time() - start_time))
         
-        # start_time = time.time()
-        if self.smooth_weight > 0 and len(total_body) > 1:
+        
+        # 2.平滑优化
+        if self.smooth_angle_weight > 0 and len(total_body) > 1:
             body_poses_total = [cur_body.body_pose for cur_body in total_body] # 获取每帧的pose
-            smooth_loss = smooth_loss + self.smooth_weight * self.calculate_smooth_loss_total(body_poses_total) # 计算平滑loss
-        # # print("calculate smooth loss: ", time.time()-start_time)
+            smooth_angle_loss = self.smooth_angle_weight * self.calculate_angle_acc_smooth_loss_total(body_poses_total) # 计算平滑loss
         
-        # if self.smooth_verts_weight > 0:
-        #     total_verts = [cur_body.vertices for cur_body in total_body]
-        #     smooth_verts_loss = smooth_verts_loss + self.smooth_verts_weight * self.calculate_verts_smooth_loss_total(total_verts) # 仅考虑相邻帧顶点距离
-        loss_dict_total['Smooth'] = smooth_loss.item()
+        if self.smooth_verts_weight > 0 and len(total_body) > 1:
+            total_verts = [cur_body.vertices for cur_body in total_body]
+            smooth_verts_loss = self.smooth_verts_weight * self.calculate_verts_vel_smooth_loss_total(total_verts) # 相邻帧顶点距离
+            
+        if self.smooth_joints_weight > 0 and len(total_body) > 1:
+            total_joints_position = [cur_body.joints[:,:55,:] for cur_body in total_body] # 每帧的关节点位置 1, 55, 3 -> 1, 76, 3 -> 1, 127, 3 y轴向上
+            smooth_joints_loss = self.smooth_joints_weight * self.calculate_joints_smooth_loss_total(total_joints_position) # 仅考虑相邻帧顶点距离
+            
+        loss_dict_total['SmoothAngle'] = smooth_angle_loss.item()
         loss_dict_total['SmoothVerts'] = smooth_verts_loss.item()
+        loss_dict_total['SmoothJoints'] = smooth_joints_loss.item()
         
-        loss = selfcontact_loss + smooth_loss + smooth_verts_loss
+        loss = selfcontact_loss + smooth_angle_loss + smooth_verts_loss + smooth_joints_loss
         
         return loss, loss_dict_total
       
@@ -438,15 +485,13 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         # time_delta = self.time[1:] - self.time[:-1] # time delta
         time_delta = 1 / self.fps
         ## Divided difference for dq_dt
-        dq_dt = torch.zeros((data_count,4),device=self.device,
-                                  dtype=torch.float32)
+        dq_dt = torch.zeros((data_count,4),device=self.device)
         # dq_dt[0][0] = 1 # 第0帧角速度设置为(1,0,0,0) 否则第一帧梯度为计算为nan
-        dq_dt[0][0] = 1 # 第0帧角速度设置为(1,0,0,0) 否则第一帧梯度为计算为nan
+        # dq_dt[0][0] = 1 # 第0帧角速度设置为(1,0,0,0) 否则第一帧梯度为计算为nan
         dq_dt[1:] = (orientation[1:] - orientation[:-1]) / time_delta # 第1帧到最后一帧计算速度，1阶导
-        # dq_dt[0] = dq_dt[1] # 第0帧角速度设置为与第1帧相同，使得第1帧角加速度为0，避免优化
+        dq_dt[0] = dq_dt[1] # 第0帧角速度设置为与第1帧相同，使得第1帧角加速度为0，避免优化
         ## Divided difference for d2q_dt2
-        d2q_dt2 = torch.zeros((data_count,4),device=self.device,
-                                  dtype=torch.float32)
+        d2q_dt2 = torch.zeros((data_count,4),device=self.device)
         
         d2q_dt2[2:] = (dq_dt[2:] - dq_dt[:-2]) / time_delta # 速度的第2帧到最后2帧计算加速度，2阶导
         # d2q_dt2[0][0] = 1 
@@ -458,20 +503,38 @@ class SelfContactOptiAnimAssignLoss(nn.Module):
         acceleration = 2 * (self.quaternion_multiply(d2q_dt2, self.quaternion_inverse(orientation)) - self.quaternion_multiply(temp,temp))
         return acceleration, velocity
     
+    # vert最小
     def calculate_verts_smooth_loss_total(self, total_verts):
-        smooth_loss = torch.tensor(0, device=self.device, dtype=torch.float32)
+        smooth_loss = torch.tensor(0.0, device=self.device)
         for i in range(1, len(total_verts)):
-            smooth_loss += F.mse_loss(total_verts[i], total_verts[i-1])
+            # smooth_loss += F.mse_loss(total_verts[i], total_verts[i-1],reduce='sum')
+            smooth_loss += self.mse_loss(total_verts[i], total_verts[i-1])
         smooth_loss = smooth_loss / len(total_verts)
         return smooth_loss
-        
-    def calculate_smooth_loss_total(self, body_poses_total):
-        smooth_loss = torch.tensor(0, device=self.device, dtype=torch.float32)
+    
+    # vert速度最小
+    def calculate_verts_vel_smooth_loss_total(self, total_verts):
+        smooth_loss = torch.tensor(0.0, device=self.device)
+        for i in range(1, len(total_verts)):
+            velocity = (total_verts[i] - total_verts[i - 1]) * self.fps
+            smooth_loss += torch.mean(torch.norm(velocity, dim=-1))
+        smooth_loss = smooth_loss / len(total_verts)
+        return smooth_loss
+    
+    def calculate_joints_smooth_loss_total(self, body_joints_position_total):
+        smooth_loss = torch.tensor(0.0, device=self.device)
+        for i in range(1, len(body_joints_position_total)):
+            # smooth_loss += F.mse_loss(total_verts[i], total_verts[i-1],reduce='sum')
+            smooth_loss += self.mse_loss(body_joints_position_total[i], body_joints_position_total[i-1])
+        smooth_loss = smooth_loss / len(body_joints_position_total)
+        return smooth_loss
+    
+    def calculate_angle_acc_smooth_loss_total(self, body_poses_total):
+        smooth_loss = torch.tensor(0.0, device=self.device)
         # for bone_idx in range(NUM_SMPLX_BODYJOINTS):
-        target_bone_idx = [13,16,18,14,11]# UPPER_BOFY_INDEX
+        target_bone_idx = self.extremities_index_21 # 21
         for bone_idx in target_bone_idx: # 右手、手臂、肩膀
-            orientation = torch.zeros((len(body_poses_total), 4),device=self.device, # 每个骨骼全部帧的四元数
-                      dtype=torch.float32)
+            orientation = torch.zeros((len(body_poses_total), 4),device=self.device) # 每个骨骼全部帧的四元数
             for frame_index, frame_pose in enumerate(body_poses_total):
                 current_pose = frame_pose.reshape(-1, 3)
                 bone_quaternion = self.get_quat_from_rodrigues_tensor(current_pose[bone_idx])

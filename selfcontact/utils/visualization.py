@@ -87,3 +87,35 @@ def save_npz_file(output_folder, npz_file_orig, total_body_mesh, file_name, cfg)
     output_dir = os.path.join(output_dir, file_name)
     np.savez_compressed(output_dir, **data_dict)
     print("result file save in {}".format(output_dir))
+    
+
+def save_smplx_mesh_with_obb(model, body, box_verts, box_faces, file_name = 'result', cfg = None, path = './output'):
+    '''
+    body是smplx模型的输出，exterior是一个布尔数组，表示每个顶点是否在模型外部
+    '''
+    mesh = trimesh.Trimesh(body.vertices[0].detach().cpu().numpy(), model.faces)
+    
+    combined_vertices = np.vstack([mesh.vertices, box_verts])
+    combined_faces = np.vstack([mesh.faces, box_faces + len(mesh.vertices)])
+    combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces)
+
+    # export mesh
+    # 计算path目录中有多少文件
+    file_path = os.path.join(cfg.output_folder, file_name)
+    if os.path.exists(file_path) == False:
+        os.makedirs(file_path, exist_ok=True)
+    num = len(os.listdir(file_path))
+    path =os.path.join(file_path, "{}_{}.obj".format(file_name,num))
+    combined_mesh.export(path)
+    print("save mesh to %s" % path)
+    
+    
+def save_smplx_mesh_bone(verts, faces, file_name = 'result', cfg = None, path = './output'):
+    mesh = trimesh.Trimesh(vertices=verts[0].detach().cpu().numpy(), faces=faces)
+    file_path = os.path.join(cfg.output_folder, file_name)
+    if os.path.exists(file_path) == False:
+        os.makedirs(file_path, exist_ok=True)
+    num = len(os.listdir(file_path))
+    path =os.path.join(file_path, "{}_{}.obj".format(file_name,num))
+    mesh.export(path)
+    print("save mesh to %s" % path)

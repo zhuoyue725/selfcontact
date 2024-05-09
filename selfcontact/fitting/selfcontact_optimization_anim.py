@@ -144,7 +144,9 @@ class SelfContactAnimOpti():
                 step += 1
 
             # back prop
+            start_time = time.time()
             total_loss.backward(retain_graph=False)
+            print('back prop: {:5f}'.format(time.time() - start_time))
             # for i in range(11):
             #     print(total_output_body_mesh[i].body_pose.grad)
             optimizer.step()

@@ -24,6 +24,8 @@ from .utils.mesh import batch_face_normals, \
                        winding_numbers
 from .body_segmentation import BatchBodySegment
 from .utils.sparse import sparse_batch_mm
+from .utils.extremities import get_vertices_assign_bone,get_connected_faces
+from .utils.obb import build_obb
 
 import os.path as osp
 import time
@@ -74,7 +76,7 @@ class SelfContact(nn.Module):
                 model_type, f'{model_type}_faces.npy')
             segments_folder = osp.join(essentials_folder, 'segments', 
                 model_type)
-            segments_bounds_path = f'{segments_folder}/{model_type}_segments_bounds.pkl'
+            self.segments_bounds_path = f'{segments_folder}/{model_type}_segments_bounds.pkl'
 
         # create faces tensor
         faces = np.load(faces_path)
@@ -86,10 +88,10 @@ class SelfContact(nn.Module):
         # the smplx mesh watertight.
         if self.model_type == 'smplx':
             inner_mouth_verts_path = f'{segments_folder}/smplx_inner_mouth_bounds.pkl'
-            vert_ids_wt = np.array(pickle.load(open(inner_mouth_verts_path, 'rb')))
+            vert_ids_wt = np.array(pickle.load(open(inner_mouth_verts_path, 'rb'))) # [33]
             self.register_buffer('vert_ids_wt', torch.from_numpy(vert_ids_wt))
             faces_wt = [[vert_ids_wt[i+1], vert_ids_wt[i],
-                faces.max().item()+1] for i in range(len(vert_ids_wt)-1)]
+                faces.max().item()+1] for i in range(len(vert_ids_wt)-1)] # (v_i+1, v_i, 10475) 32个三角面用于闭合嘴巴
             faces_wt = torch.tensor(np.array(faces_wt).astype(np.int64),
                 dtype=torch.long)
             faces_wt = torch.cat((faces, faces_wt), 0)
@@ -105,7 +107,7 @@ class SelfContact(nn.Module):
 
         # create batch segmentation here
         if self.test_segments:
-            sxseg = pickle.load(open(segments_bounds_path, 'rb'))
+            sxseg = pickle.load(open(self.segments_bounds_path, 'rb'))
             self.segments = BatchBodySegment(
                 [x for x in sxseg.keys()], faces, segments_folder, self.model_type
             )
@@ -134,9 +136,55 @@ class SelfContact(nn.Module):
             mouth_vert = torch.mean(vertices[:,self.vert_ids_wt,:], 1, # 嘴巴部位的平均顶点
                         keepdim=True)
             vertices_mc = torch.cat((vertices, mouth_vert), 1) # 拼接 [1, 10475+1, 3]
-            triangles = vertices_mc[:,self.faces_wt,:] # faces_wt [20940, 3]
-        return triangles
-
+            triangles = vertices_mc[:,self.faces_wt,:] # faces_wt [20908+32, 3] (边界2个点+嘴巴闭合1个点)
+        return triangles # [1, 20940 3, 3]
+    
+    def get_obbs(self, vertices):
+        """
+            计算OBB
+        """
+        obbs = []
+        SEGMENTATION_PATH = '/usr/pydata/t2m/selfcontact/selfcontact-essentials/models_utils/smplx/smplx_segmentation_id.npy'
+        for bone_idx in range(55):
+            vert_idx = get_vertices_assign_bone(SEGMENTATION_PATH, bone_idx)
+            box_verts, box_face = build_obb(vertices[:, vert_idx, :].squeeze(0))
+            box_triangle = box_verts[box_face]
+            obbs.append(box_triangle)
+        return obbs
+    
+    def get_intersection_mask_obb(self, vertices, triangles, test_segments=True):
+        """
+            先计算OBB是否相交，再计算顶点与对应部位是否相交
+        """
+        i = 21
+        self.obbs = self.get_obbs(vertices)
+        bs, nv, _ = vertices.shape
+        exterior = torch.zeros((bs, nv), device=vertices.device, # [1, 10475] 在外部则为True 
+            dtype=torch.bool)
+        # for i, obb in enumerate(self.obbs):
+        for j, obb2 in enumerate(self.obbs):
+            if i == j: # 或者i、j是父子关系
+                continue
+            if self.isIntersection(obb, obb2):
+                bound_faces = []
+                inner_faces = []
+                for face in self.cm.faces:
+                    vert_idx = get_vertices_assign_bone(SEGMENTATION_PATH, j)
+                    count = sum(1 for vertex in face if vertex.item() in vert_idx) # 两个顶点在该部位，认为是边界三角形
+                    if count == 2:
+                        bound_faces.append(np.array(face.cpu()))
+                    if count == 3:
+                        inner_faces.append(np.array(face.cpu()))
+                bound_faces = np.array(bound_faces)
+                inner_faces = np.array(inner_faces)
+                verts_with_bone_close, face_with_bone_close = get_connected_faces(vertices, bound_faces, self.cm.faces) # list
+                if len(face_with_bone_close) > 0:
+                    inner_and_bound_faces = np.concatenate((inner_faces, face_with_bone_close), axis=0)
+                target_triangles = verts_with_bone_close[inner_and_bound_faces]
+                cur_exterior = self.get_intersection_mask(vertices, target_triangles, test_segments)
+                exterior[cur_exterior[0]] = True
+        return exterior
+        
     def get_intersection_mask(self, vertices, triangles, test_segments=True):
         """
             compute status of vertex: inside, outside, or colliding
@@ -166,20 +214,20 @@ class SelfContact(nn.Module):
             sys.exit()
         if test_segments and self.test_segments:
             for segm_name in self.segments.names:
-                segm_vids = self.segments.segmentation[segm_name].segment_vidx
+                segm_vids = self.segments.segmentation[segm_name].segment_vidx # BodySegment().segment_vidx
                 for bidx in range(bs):
                     if (exterior[bidx, segm_vids] == 0).sum() > 0: # 该部位有顶点在内部
-                        segm_verts = vertices[bidx, segm_vids, :].unsqueeze(0)
-                        # 该部位外部顶点
+                        segm_verts = vertices[bidx, segm_vids, :].unsqueeze(0) # 该部位的所有顶点
+                        # 检查该部位是否有自交(与整个身体求交)
                         segm_ext = self.segments.segmentation[segm_name] \
                             .has_self_isect_points(
                                 segm_verts.detach(),
                                 triangles[bidx].unsqueeze(0)
-                        )
-                        mask = ~segm_ext[bidx]
+                        ) 
+                        mask = ~segm_ext[bidx] # 自交顶点
                         segm_idxs = torch.masked_select(segm_vids, mask) # 自交顶点的索引
-                        true_tensor = torch.ones(segm_idxs.shape, device=segm_idxs.device, dtype=torch.bool)
-                        exterior[bidx, segm_idxs] = true_tensor # 忽略这些自交顶点
+                        # true_tensor = torch.ones(segm_idxs.shape, device=segm_idxs.device, dtype=torch.bool)
+                        exterior[bidx, segm_idxs] = True # 忽略这些自交顶点
 
         return exterior
 
@@ -210,7 +258,7 @@ class SelfContact(nn.Module):
 
     def segment_vertices(self, vertices, compute_hd=False, test_segments=True):
         """
-            get self-intersecting vertices and pairwise distance, 获取自交顶点和顶点间距离
+            get self-intersecting vertices and pairwise distance, 获取自交顶点和顶点间距离（所有三角形）首次的计算
         """
         bs = vertices.shape[0]
 
@@ -277,9 +325,9 @@ class SelfContact(nn.Module):
             # print('get intersection vertices: {:5f}'.format(time.time() - start))
 
             v2v_mask = v2v.detach().clone()
-            #v2v_mask[:, ~self.geomask] = float('inf')
-            inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # 不满足测地距离，设置顶点之间距离为inf
-            v2v_mask[:, ~self.geomask] = inf_tensor
+            v2v_mask[:, ~self.geomask] = float('inf')
+            # inf_tensor = float('inf') * torch.ones((1,(~self.geomask).sum().item()), device=v2v.device) # 不满足测地距离，设置顶点之间距离为inf
+            # v2v_mask[:, ~self.geomask] = inf_tensor
             _, v2v_min_index = torch.min(v2v_mask, dim=1)
 
         #v2v_min = torch.gather(v2v, dim=2,
@@ -424,6 +472,9 @@ class SelfContact(nn.Module):
         # return v2v_min
        
     def segment_points_scopti_ds(self, ds, ds_vertices, vertices):
+        """
+            ds对应的三角形的最近顶点距离、最近顶点索引、是否在外部
+        """
         nv_ds = ds.shape[0] # ds中顶点的数量
         # ds_vertices_flat = ds_vertices.view(-1, 3)
         # # ds_vertices_flat = points.view(-1, 3)
@@ -437,7 +488,7 @@ class SelfContact(nn.Module):
         # # 计算距离的平方根
         # v2v_ds = torch.sqrt(distances_squared)
         
-        with torch.no_grad():
+        with torch.no_grad(): # 计算内部不需要梯度？
             triangles = self.triangles(vertices.detach()) # [1, 20940, 3, 3] 已计算过？
 
             # start = time.time()
@@ -586,7 +637,24 @@ class SelfContact(nn.Module):
 
         return hd_v2v_mins, hd_exteriors, hd_points, hd_faces_in_contacts
 
-
+    def get_connected_faces(self):
+        sxseg = pickle.load(open(self.segments_bounds_path, 'rb'))
+        all_bound_faces = None
+        # 遍历字典中的每个键值对
+        for key, value in sxseg.items():
+            # 遍历每个键值对中的值，即顶点索引列表
+            for key2, vert_idx in value.items():
+                bound_faces = []
+                for face in self.faces:
+                    count = sum(1 for vertex in face if vertex.item() in vert_idx) # 两个顶点在该部位，认为是边界三角形
+                    if count >= 2:
+                        bound_faces.append(np.array(face.cpu()))
+                bound_faces = np.array(bound_faces)
+                if all_bound_faces is not None:
+                    all_bound_faces = np.concatenate((all_bound_faces, bound_faces), axis=0)
+                else:
+                    all_bound_faces = bound_faces
+        return all_bound_faces
 
 class SelfContactSmall(nn.Module):
     def __init__(self,
@@ -661,3 +729,5 @@ class SelfContactSmall(nn.Module):
                 in_contact = torch.where(in_contact)
 
             return in_contact
+
+            
